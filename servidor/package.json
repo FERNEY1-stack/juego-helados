@@ -1,0 +1,12 @@
+{
+  "name": "hornos-rebeldes-relevo",
+  "version": "1.0.0",
+  "description": "Servidor de relevo para jugar Los Hornos Rebeldes por internet (sin dependencias)",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

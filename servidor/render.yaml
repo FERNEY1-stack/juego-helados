@@ -1,0 +1,9 @@
+# Configuración para Render (https://render.com). Sube esta carpeta a GitHub y
+# crea un "Blueprint" o "Web Service" apuntando a ella.
+services:
+  - type: web
+    name: hornos-relevo
+    runtime: node
+    plan: free
+    buildCommand: echo "sin dependencias"
+    startCommand: node relay.js
