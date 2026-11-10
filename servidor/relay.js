@@ -211,6 +211,7 @@ function alDesconectar(ws) {
   } else if (sala.cliente === ws) {
     // Si se va el cliente, el anfitrión puede esperar a otro
     sala.cliente = null;
+    sala.sinParejaDesde = Date.now();
     sala.host.enviarJson({ t: 'par_salio' });
     console.log(`[sala ${ws.sala}] el segundo jugador se fue`);
   }
@@ -218,9 +219,108 @@ function alDesconectar(ws) {
 
 // ---------- Servidor HTTP (con "upgrade" a WebSocket) ----------
 
+// ---------- Marcadores ----------
+// tabla "infinito": gana la ronda más alta. Las demás ("rush", "diario-NNNNN"):
+// gana el tiempo más bajo (segundos). Se guarda en memoria y en puntajes.json
+// (en el plan gratis de Render el disco se borra al redesplegar o reiniciar).
+const fs = require('fs');
+const ARCHIVO_PUNTAJES = process.env.PUNTAJES_ARCHIVO || 'puntajes.json';
+const MAX_TABLAS = 80;
+const TOP = 20;
+const tablas = new Map(); // tabla -> Map(nombre -> valor)
+
+try {
+  const crudo = JSON.parse(fs.readFileSync(ARCHIVO_PUNTAJES, 'utf8'));
+  for (const [t, filas] of Object.entries(crudo)) tablas.set(t, new Map(Object.entries(filas)));
+} catch (e) { /* primera vez */ }
+
+let guardando = null;
+function guardarPuntajes() {
+  if (guardando) return;
+  guardando = setTimeout(() => {
+    guardando = null;
+    const o = {};
+    for (const [t, m] of tablas) o[t] = Object.fromEntries(m);
+    fs.writeFile(ARCHIVO_PUNTAJES, JSON.stringify(o), () => {});
+  }, 5000);
+  guardando.unref();
+}
+
+const mejorEsMayor = (tabla) => tabla === 'infinito';
+const tablaValida = (t) => /^[a-z0-9-]{1,20}$/.test(t);
+
+function ordenado(tabla) {
+  const m = tablas.get(tabla) || new Map();
+  const filas = [...m.entries()].map(([nombre, valor]) => ({ nombre, valor }));
+  filas.sort((a, b) => (mejorEsMayor(tabla) ? b.valor - a.valor : a.valor - b.valor));
+  return filas.slice(0, TOP);
+}
+
+function limpiarNombre(n) {
+  return String(n || '').replace(/[^\p{L}\p{N} _-]/gu, '').trim().slice(0, 12);
+}
+
+const visitas = new Map(); // ip -> [contador, ventana]
+function demasiadas(req) {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const ahora = Math.floor(Date.now() / 60000);
+  const v = visitas.get(ip);
+  if (!v || v[1] !== ahora) { visitas.set(ip, [1, ahora]); return false; }
+  v[0]++;
+  return v[0] > 60;
+}
+
+function responder(res, codigo, obj) {
+  res.writeHead(codigo, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+  res.end(JSON.stringify(obj));
+}
+
+function recibirPuntaje(req, res) {
+  let cuerpo = '';
+  req.on('data', (d) => { cuerpo += d; if (cuerpo.length > 2000) req.destroy(); });
+  req.on('end', () => {
+    let m;
+    try { m = JSON.parse(cuerpo); } catch (e) { return responder(res, 400, { ok: false }); }
+    const tabla = String(m.tabla || '');
+    const nombre = limpiarNombre(m.nombre);
+    const valor = Number(m.valor);
+    if (!tablaValida(tabla) || !nombre || !Number.isFinite(valor)) return responder(res, 400, { ok: false });
+    if (tabla === 'infinito' ? (valor < 1 || valor > 999) : (valor < 5 || valor > 36000)) return responder(res, 400, { ok: false });
+    if (!tablas.has(tabla)) {
+      if (tablas.size >= MAX_TABLAS) return responder(res, 400, { ok: false });
+      tablas.set(tabla, new Map());
+    }
+    const filas = tablas.get(tabla);
+    const antes = filas.get(nombre);
+    const valorFinal = mejorEsMayor(tabla) ? Math.round(valor) : Math.round(valor * 10) / 10;
+    if (antes === undefined || (mejorEsMayor(tabla) ? valorFinal > antes : valorFinal < antes)) {
+      filas.set(nombre, valorFinal);
+      guardarPuntajes();
+    }
+    responder(res, 200, { ok: true, top: ordenado(tabla) });
+  });
+}
+
 const servidor = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  if (req.method === 'OPTIONS') return responder(res, 204, {});
+  if (url.pathname === '/top' && req.method === 'GET') {
+    if (demasiadas(req)) return responder(res, 429, { ok: false });
+    const tabla = url.searchParams.get('tabla') || '';
+    if (!tablaValida(tabla)) return responder(res, 400, { ok: false });
+    return responder(res, 200, { ok: true, top: ordenado(tabla) });
+  }
+  if (url.pathname === '/puntaje' && req.method === 'POST') {
+    if (demasiadas(req)) return responder(res, 429, { ok: false });
+    return recibirPuntaje(req, res);
+  }
   // Respuesta simple para comprobar desde el navegador que está funcionando
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
   res.end(`Servidor de relevo de Los Hornos Rebeldes: activo (${salas.size} salas)\n`);
 });
 
@@ -253,7 +353,7 @@ setInterval(() => {
   // Salas a las que nadie se unió en un buen rato
   const limite = Date.now() - MINUTOS_SIN_PAREJA * 60 * 1000;
   for (const [codigo, sala] of salas) {
-    if (!sala.cliente && sala.creada < limite) {
+    if (!sala.cliente && (sala.sinParejaDesde || sala.creada) < limite) {
       sala.host.cerrar(1000);
       salas.delete(codigo);
     }
