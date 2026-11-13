@@ -229,22 +229,100 @@ const MAX_TABLAS = 80;
 const TOP = 20;
 const tablas = new Map(); // tabla -> Map(nombre -> valor)
 
-try {
-  const crudo = JSON.parse(fs.readFileSync(ARCHIVO_PUNTAJES, 'utf8'));
-  for (const [t, filas] of Object.entries(crudo)) tablas.set(t, new Map(Object.entries(filas)));
-} catch (e) { /* primera vez */ }
+// Base de datos GRATIS (Upstash Redis) para que los marcadores sobrevivan cuando
+// Render reinicia el servidor. Si no se configuran las dos variables de entorno,
+// todo sigue funcionando igual pero solo con el archivo (que Render borra).
+//   UPSTASH_REDIS_REST_URL    y    UPSTASH_REDIS_REST_TOKEN
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_CLAVE = 'hornos:puntajes:v1';
+const usaRedis = Boolean(REDIS_URL && REDIS_TOKEN && typeof fetch === 'function');
+let estadoBase = usaRedis ? 'conectando' : 'solo archivo';
+
+async function redis(comando) {
+  const r = await fetch(REDIS_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(comando),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error(`Redis respondió ${r.status}`);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j.result;
+}
+
+function cargarDesde(crudo) {
+  for (const [t, filas] of Object.entries(crudo)) {
+    if (!tablaValida(t)) continue;
+    const m = tablas.get(t) || new Map();
+    for (const [nombre, valor] of Object.entries(filas)) {
+      const v = Number(valor);
+      if (!Number.isFinite(v)) continue;
+      const antes = m.get(nombre);
+      if (antes === undefined || (mejorEsMayor(t) ? v > antes : v < antes)) m.set(nombre, v);
+    }
+    tablas.set(t, m);
+  }
+}
+
+// Hasta que termine de cargar no se atiende ningún marcador (así no se pisan los datos)
+const cargaInicial = (async () => {
+  try { cargarDesde(JSON.parse(fs.readFileSync(ARCHIVO_PUNTAJES, 'utf8'))); } catch (e) { /* primera vez */ }
+  if (usaRedis) {
+    try {
+      const guardado = await redis(['GET', REDIS_CLAVE]);
+      if (guardado) cargarDesde(JSON.parse(guardado));
+      estadoBase = 'base de datos';
+      console.log(`[marcadores] base de datos conectada (${tablas.size} tablas)`);
+      if (tablas.size > 0) pendiente = true;       // por si el archivo traía algo que la base no tenía
+    } catch (e) {
+      estadoBase = 'base de datos con error';
+      console.log('[marcadores] no se pudo leer la base de datos:', e.message);
+    }
+  }
+})();
 
 let guardando = null;
+let pendiente = false;
+async function guardarYa() {
+  const o = {};
+  for (const [t, m] of tablas) o[t] = Object.fromEntries(m);
+  const texto = JSON.stringify(o);
+  try { fs.writeFileSync(ARCHIVO_PUNTAJES, texto); } catch (e) { /* el disco puede ser de solo lectura */ }
+  if (usaRedis && estadoBase !== 'conectando') {
+    try {
+      await redis(['SET', REDIS_CLAVE, texto]);
+      estadoBase = 'base de datos';
+      pendiente = false;
+    } catch (e) {
+      estadoBase = 'base de datos con error';
+      pendiente = true;                              // se reintenta en el próximo guardado
+      console.log('[marcadores] no se pudo guardar en la base de datos:', e.message);
+    }
+  } else {
+    pendiente = false;
+  }
+}
 function guardarPuntajes() {
+  pendiente = true;
   if (guardando) return;
-  guardando = setTimeout(() => {
+  guardando = setTimeout(async () => {
     guardando = null;
-    const o = {};
-    for (const [t, m] of tablas) o[t] = Object.fromEntries(m);
-    fs.writeFile(ARCHIVO_PUNTAJES, JSON.stringify(o), () => {});
-  }, 5000);
+    await guardarYa();
+  }, 4000);
   guardando.unref();
 }
+// Si la base falló, se reintenta cada minuto
+setInterval(() => { if (pendiente && !guardando) guardarPuntajes(); }, 60000).unref();
+
+// Render avisa con SIGTERM antes de reiniciar: se guarda de inmediato
+async function apagar() {
+  try { await guardarYa(); } catch (e) { /* nada */ }
+  process.exit(0);
+}
+process.on('SIGTERM', apagar);
+process.on('SIGINT', apagar);
 
 const mejorEsMayor = (tabla) => tabla === 'infinito';
 const tablaValida = (t) => /^[a-z0-9-]{1,20}$/.test(t);
@@ -306,22 +384,24 @@ function recibirPuntaje(req, res) {
   });
 }
 
-const servidor = http.createServer((req, res) => {
+const servidor = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'OPTIONS') return responder(res, 204, {});
   if (url.pathname === '/top' && req.method === 'GET') {
     if (demasiadas(req)) return responder(res, 429, { ok: false });
+    await cargaInicial;
     const tabla = url.searchParams.get('tabla') || '';
     if (!tablaValida(tabla)) return responder(res, 400, { ok: false });
     return responder(res, 200, { ok: true, top: ordenado(tabla) });
   }
   if (url.pathname === '/puntaje' && req.method === 'POST') {
     if (demasiadas(req)) return responder(res, 429, { ok: false });
+    await cargaInicial;
     return recibirPuntaje(req, res);
   }
   // Respuesta simple para comprobar desde el navegador que está funcionando
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
-  res.end(`Servidor de relevo de Los Hornos Rebeldes: activo (${salas.size} salas)\n`);
+  res.end(`Servidor de relevo de Los Hornos Rebeldes: activo (${salas.size} salas)\nMarcadores: ${estadoBase}${estadoBase === 'base de datos' ? ' ✔ (no se pierden al reiniciar)' : ''}\n`);
 });
 
 const conexiones = new Set();
